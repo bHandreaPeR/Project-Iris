@@ -436,10 +436,16 @@ def momentum_features(price_hist: pd.DataFrame, as_of: pd.Timestamp) -> dict:
 
     ph = price_hist['Close'].sort_index()
 
+    # Normalise timezone: strip tz from index if it's tz-aware so we can
+    # compare against tz-naive quarter-end timestamps throughout
+    if ph.index.tz is not None:
+        ph.index = ph.index.tz_localize(None)
+    as_of_naive = as_of.tz_localize(None) if as_of.tzinfo is not None else as_of
+
     def ret(days):
         try:
-            end   = ph.loc[:as_of].iloc[-1]
-            start = ph.loc[:as_of - pd.DateOffset(days=days)].iloc[-1]
+            end   = ph.loc[:as_of_naive].iloc[-1]
+            start = ph.loc[:as_of_naive - pd.DateOffset(days=days)].iloc[-1]
             return _safe_div(end - start, abs(start))
         except IndexError:
             return _nan()
@@ -452,7 +458,7 @@ def momentum_features(price_hist: pd.DataFrame, as_of: pd.Timestamp) -> dict:
     # 20-day realised volatility (annualised)
     vol_20d = _nan()
     try:
-        slice_ = ph.loc[:as_of].iloc[-21:]
+        slice_ = ph.loc[:as_of_naive].iloc[-21:]
         if len(slice_) >= 5:
             log_rets = np.log(slice_ / slice_.shift(1)).dropna()
             vol_20d  = float(log_rets.std() * math.sqrt(252))

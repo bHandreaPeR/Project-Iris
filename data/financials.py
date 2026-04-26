@@ -15,6 +15,7 @@ Note on Indian stocks (.NS):
   engineer handles them gracefully.
 """
 
+import math
 import time
 import pandas as pd
 import yfinance as yf
@@ -22,8 +23,14 @@ import yfinance as yf
 
 def fetch_statements(ticker: str) -> dict:
     """
-    Fetch all four financial tables + price history for one ticker.
-    Returns a dict with keys: income, balance, cashflow, price_hist, info.
+    Fetch quarterly + annual financial tables, price history, and info.
+
+    Keys returned:
+      income, balance, cashflow          — quarterly statements
+      annual_income, annual_balance,
+      annual_cashflow                    — annual statements (for Piotroski / Beneish)
+      price_hist                         — 5-year daily OHLCV
+      info                               — yfinance .info dict
     """
     t = yf.Ticker(ticker)
 
@@ -32,14 +39,16 @@ def fetch_statements(ticker: str) -> dict:
             df = getattr(t, attr)
             if df is None or df.empty:
                 return pd.DataFrame()
-            # columns are period-end Timestamps → sort ascending
             return df.sort_index(axis=1)
         except Exception:
             return pd.DataFrame()
 
-    income   = _get('quarterly_income_stmt')
-    balance  = _get('quarterly_balance_sheet')
-    cashflow = _get('quarterly_cashflow')
+    income          = _get('quarterly_income_stmt')
+    balance         = _get('quarterly_balance_sheet')
+    cashflow        = _get('quarterly_cashflow')
+    annual_income   = _get('income_stmt')
+    annual_balance  = _get('balance_sheet')
+    annual_cashflow = _get('cashflow')
 
     try:
         price_hist = t.history(period='5y', interval='1d', auto_adjust=True)
@@ -52,11 +61,69 @@ def fetch_statements(ticker: str) -> dict:
         info = {}
 
     return {
-        'income':     income,
-        'balance':    balance,
-        'cashflow':   cashflow,
-        'price_hist': price_hist,
-        'info':       info,
+        'income':          income,
+        'balance':         balance,
+        'cashflow':        cashflow,
+        'annual_income':   annual_income,
+        'annual_balance':  annual_balance,
+        'annual_cashflow': annual_cashflow,
+        'price_hist':      price_hist,
+        'info':            info,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cash conversion cycle helpers
+# ---------------------------------------------------------------------------
+
+def _ttm_val(df: pd.DataFrame, *keys) -> float:
+    """TTM sum of the first matched row key."""
+    for k in keys:
+        if k in df.index:
+            vals = df.loc[k].dropna()
+            if len(vals) >= 4:
+                return float(vals.iloc[-4:].sum())
+            elif len(vals) > 0:
+                return float(vals.iloc[-1] * (4 / len(vals.iloc[-4:])))
+    return float('nan')
+
+
+def _latest(df: pd.DataFrame, *keys) -> float:
+    """Most recent non-null value for first matched row key."""
+    for k in keys:
+        if k in df.index:
+            vals = df.loc[k].dropna()
+            if len(vals):
+                return float(vals.iloc[-1])
+    return float('nan')
+
+
+def cash_cycle_features(quarterly_inc: pd.DataFrame,
+                        quarterly_bs: pd.DataFrame) -> dict:
+    """
+    Compute DSO, DIO, DPO and cash conversion cycle.
+    Uses trailing 12-month revenue/COGS and most-recent balance sheet values.
+    All values are in days — NaN if required data unavailable.
+    """
+    rev_ttm  = _ttm_val(quarterly_inc, 'Total Revenue')
+    cogs_ttm = _ttm_val(quarterly_inc, 'Cost Of Revenue', 'Cost Of Goods And Services Sold')
+    rec      = _latest(quarterly_bs, 'Accounts Receivable')
+    inv      = _latest(quarterly_bs, 'Inventory')
+    pay      = _latest(quarterly_bs, 'Accounts Payable')
+
+    def _nan(): return float('nan')
+    def _div(a, b): return float('nan') if (math.isnan(a) or math.isnan(b) or b == 0) else a / b
+
+    dso = _div(rec, rev_ttm) * 365  if not (math.isnan(rec) or math.isnan(rev_ttm))  else _nan()
+    dio = _div(inv, cogs_ttm) * 365 if not (math.isnan(inv) or math.isnan(cogs_ttm)) else _nan()
+    dpo = _div(pay, cogs_ttm) * 365 if not (math.isnan(pay) or math.isnan(cogs_ttm)) else _nan()
+    ccc = dso + dio - dpo           if not any(math.isnan(x) for x in [dso, dio, dpo]) else _nan()
+
+    return {
+        'wc_dso': dso,
+        'wc_dio': dio,
+        'wc_dpo': dpo,
+        'wc_ccc': ccc,
     }
 
 
