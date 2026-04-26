@@ -85,10 +85,13 @@ def fetch_sp500(force_refresh: bool = False) -> list[str]:
 
     print("[universe] Fetching S&P 500 from Wikipedia …")
     try:
-        tables = pd.read_html(
+        import io
+        resp = requests.get(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            attrs={"id": "constituents"},
+            headers=_HEADERS, timeout=30,
         )
+        resp.raise_for_status()
+        tables = pd.read_html(io.StringIO(resp.text), attrs={"id": "constituents"})
         df = tables[0]
         # Wikipedia column: "Symbol" — dots in some tickers (e.g. BRK.B → BRK-B for yfinance)
         tickers = (
