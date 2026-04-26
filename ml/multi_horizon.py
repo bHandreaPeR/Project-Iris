@@ -116,6 +116,7 @@ class HorizonModel:
     oof_records: list = field(default_factory=list)
 
     def _fit_one(self, alpha: float, X: np.ndarray, y: np.ndarray) -> xgb.XGBRegressor:
+        X = np.where(np.isinf(X), np.nan, X)
         model = _xgb_quantile(alpha)
         model.fit(X, y)
         return model
@@ -204,6 +205,7 @@ class HorizonModel:
 
     def predict(self, X: np.ndarray) -> dict:
         """Returns dict with lower, point, upper predictions."""
+        X = np.where(np.isinf(X.astype(float)), np.nan, X.astype(float))
         return {
             'lower': float(self.q10.predict(X)[0]),
             'point': float(self.q50.predict(X)[0]),
@@ -261,7 +263,8 @@ class MultiHorizonModel:
         Generate predictions for a single ticker (as a feature Series).
         Returns dict keyed by target with lower/point/upper.
         """
-        X = ticker_feats[self.feat_cols].values.reshape(1, -1)
+        X = ticker_feats.reindex(self.feat_cols).values.astype(float).reshape(1, -1)
+        X = np.where(np.isinf(X), np.nan, X)
         return {target: m.predict(X) for target, m in self.models.items()}
 
     def walk_forward_summary(self, metrics: dict[str, dict]) -> str:
