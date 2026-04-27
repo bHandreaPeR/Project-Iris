@@ -60,6 +60,16 @@ def fetch_statements(ticker: str) -> dict:
     except Exception:
         info = {}
 
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            earnings_hist = t.earnings_history
+            if earnings_hist is None:
+                earnings_hist = pd.DataFrame()
+    except Exception:
+        earnings_hist = pd.DataFrame()
+
     return {
         'income':          income,
         'balance':         balance,
@@ -69,6 +79,7 @@ def fetch_statements(ticker: str) -> dict:
         'annual_cashflow': annual_cashflow,
         'price_hist':      price_hist,
         'info':            info,
+        'earnings_hist':   earnings_hist,
     }
 
 

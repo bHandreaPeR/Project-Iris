@@ -29,6 +29,8 @@ from ml.features import (
     valuation_features, profitability_features, revenue_growth_features,
     earnings_growth_features, balance_sheet_features, cashflow_quality_features,
     income_detail_features, momentum_features,
+    roic_features, asset_growth_features, gross_profit_assets,
+    tech_features, earnings_surprise_features_v2, eps_acceleration_features,
 )
 
 
@@ -232,6 +234,14 @@ def compute_all_v2(stmts: dict,
     # ── New: EPS growth proxy / PEAD ─────────────────────────────────────
     feats.update(earnings_surprise_features(info))
 
+    # ── Tier-1 additions ─────────────────────────────────────────────────
+    feats.update(roic_features(stmts))
+    feats.update(asset_growth_features(stmts))
+    feats.update(gross_profit_assets(stmts))
+    feats.update(tech_features(stmts.get('price_hist', pd.DataFrame()), as_of))
+    feats.update(earnings_surprise_features_v2(stmts, as_of))
+    feats.update(eps_acceleration_features(stmts))
+
     # ── Optional: Shareholding pattern (India NSE / US 13F) ─────────────
     if shareholding:
         feats.update(shareholding)
@@ -274,6 +284,7 @@ def feature_names() -> list[str]:
         'cashflow': pd.DataFrame(), 'price_hist': pd.DataFrame(),
         'annual_income': pd.DataFrame(), 'annual_balance': pd.DataFrame(),
         'annual_cashflow': pd.DataFrame(), 'info': {},
+        'earnings_hist': pd.DataFrame(),
     }
     dummy = compute_all_v2(dummy_stmts, pd.Timestamp('2020-01-01'))
     return list(dummy.keys())

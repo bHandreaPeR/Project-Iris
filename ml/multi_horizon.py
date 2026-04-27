@@ -145,10 +145,23 @@ class HorizonModel:
             if train.index.get_level_values('quarter_end').nunique() < MIN_QUARTERS:
                 continue
 
-            X_tr = train[self.feat_cols].values
-            y_tr = train[self.target].values
-            X_te = test[self.feat_cols].values
-            y_te = test[self.target].values
+            X_tr = train[self.feat_cols].values.astype(float)
+            y_tr = train[self.target].values.astype(float)
+            X_te = test[self.feat_cols].values.astype(float)
+            y_te = test[self.target].values.astype(float)
+
+            # Replace inf with nan (division-by-zero artifacts in ratio features)
+            X_tr = np.where(np.isinf(X_tr), np.nan, X_tr)
+            X_te = np.where(np.isinf(X_te), np.nan, X_te)
+
+            # Per-fold winsorization at 1st/99th percentile (computed on train only)
+            # Prevents base-effect distortions (e.g. NI YoY = +∞ on loss-to-profit)
+            lo = np.nanpercentile(X_tr, 1, axis=0)
+            hi = np.nanpercentile(X_tr, 99, axis=0)
+            X_tr = np.clip(X_tr, lo, hi)
+            X_te = np.clip(X_te, lo, hi)
+            self._winsor_lo = lo   # store for final model
+            self._winsor_hi = hi
 
             # Fit q50 (point estimate) for IC evaluation
             m50 = self._fit_one(0.50, X_tr, y_tr)
@@ -197,8 +210,13 @@ class HorizonModel:
     def fit_final(self, panel: pd.DataFrame) -> None:
         """Retrain all 3 quantile models on ALL available data."""
         df = panel.dropna(subset=[self.target])
-        X  = df[self.feat_cols].values
-        y  = df[self.target].values
+        X  = df[self.feat_cols].values.astype(float)
+        y  = df[self.target].values.astype(float)
+        X  = np.where(np.isinf(X), np.nan, X)
+        # Compute and store winsorization bounds from full dataset
+        self._winsor_lo = np.nanpercentile(X, 1, axis=0)
+        self._winsor_hi = np.nanpercentile(X, 99, axis=0)
+        X = np.clip(X, self._winsor_lo, self._winsor_hi)
         self.q10 = self._fit_one(0.10, X, y)
         self.q50 = self._fit_one(0.50, X, y)
         self.q90 = self._fit_one(0.90, X, y)
@@ -206,6 +224,8 @@ class HorizonModel:
     def predict(self, X: np.ndarray) -> dict:
         """Returns dict with lower, point, upper predictions."""
         X = np.where(np.isinf(X.astype(float)), np.nan, X.astype(float))
+        if hasattr(self, '_winsor_lo') and self._winsor_lo is not None:
+            X = np.clip(X, self._winsor_lo, self._winsor_hi)
         return {
             'lower': float(self.q10.predict(X)[0]),
             'point': float(self.q50.predict(X)[0]),

@@ -28,6 +28,7 @@ import pandas as pd
 import numpy as np
 
 from data.financials import fetch_statements
+from data.financials_india import fetch_statements_india
 from data.nse_shareholding import shareholding_features
 from data.sec_insiders import insider_summary
 from data.news_pipeline import fetch_news_sentiment
@@ -115,13 +116,12 @@ def build_ticker_panel(ticker: str,
     sector       = stmts.get('info', {}).get('sector', '')
 
     rows = []
-    for qe in quarter_ends:
-        entry_date = qe + pd.DateOffset(days=lag)
+    quarter_end_set: set[pd.Timestamp] = set()
 
-        # Clip statements to data available at qe
+    def _build_row(qe: pd.Timestamp) -> dict | None:
+        entry_date = qe + pd.DateOffset(days=lag)
         snap = _clip_stmts(stmts, qe)
 
-        # News sentiment: fetch as of entry date (real-time at prediction time)
         news_data = None
         if use_news:
             try:
@@ -137,23 +137,38 @@ def build_ticker_panel(ticker: str,
                                    insider=insider_data,
                                    news=news_data)
         except Exception:
-            continue
+            return None
 
-        # Require at least 10 non-NaN features (otherwise row is too sparse)
-        n_valid = sum(1 for v in feats.values() if not math.isnan(float(v) if isinstance(v, (int, float)) else float('nan')))
+        n_valid = sum(1 for v in feats.values()
+                      if not math.isnan(float(v) if isinstance(v, (int, float)) else float('nan')))
         if n_valid < 10:
-            continue
+            return None
 
         row = {'ticker': ticker, 'quarter_end': qe, 'entry_date': entry_date}
         row.update(feats)
-
-        # Forward returns for all 3 horizons
         for col, days in HORIZONS.items():
             exit_date = entry_date + pd.DateOffset(days=days)
             row[col] = _fwd_return(stmts.get('price_hist', pd.DataFrame()),
                                    entry_date, exit_date)
+        return row
 
-        rows.append(row)
+    # Quarterly rows (from income stmt — typically 13 quarters from screener.in)
+    for qe in quarter_ends:
+        r = _build_row(qe)
+        if r is not None:
+            rows.append(r)
+            quarter_end_set.add(qe)
+
+    # Annual rows — extend history back to 2015 using annual statements
+    ann_inc = stmts.get('annual_income', pd.DataFrame())
+    if not ann_inc.empty:
+        ann_dates = sorted([pd.Timestamp(c) for c in ann_inc.columns])
+        for ann_qe in ann_dates:
+            if ann_qe in quarter_end_set:
+                continue  # already have a quarterly row for this period
+            r = _build_row(ann_qe)
+            if r is not None:
+                rows.append(r)
 
     if not rows:
         return pd.DataFrame()
@@ -192,7 +207,9 @@ def build_panel(tickers: list[str],
         if verbose:
             print(f"[collector_v2] {i:3d}/{n}  {tkr:<20}", end="  ", flush=True)
         try:
-            stmts = fetch_statements(tkr)
+            stmts = (fetch_statements_india(tkr)
+                     if tkr.endswith(('.NS', '.BO'))
+                     else fetch_statements(tkr))
             ticker_df = build_ticker_panel(
                 tkr, stmts,
                 use_shareholding=use_shareholding,
@@ -209,7 +226,7 @@ def build_panel(tickers: list[str],
         except Exception as e:
             if verbose:
                 print(f"ERROR: {e}")
-        time.sleep(0.4)
+        time.sleep(0.2)
 
     if not all_panels:
         print("[collector_v2] No data collected.")
