@@ -60,13 +60,19 @@ def find_stale_tickers(panel: pd.DataFrame, max_workers: int = REFRESH_CHECK_WOR
     Return tickers whose latest panel quarter_end is older than what yfinance
     currently reports — i.e. the company has filed new results since last run.
     """
-    # Latest quarter per ticker in the panel
-    panel_latest: dict[str, pd.Timestamp] = (
-        panel.reset_index()
-             .groupby("ticker")["quarter_end"]
-             .max()
-             .to_dict()
-    )
+    # Latest quarter per ticker — use quarter_end column (v5) or index level (legacy)
+    reset = panel.reset_index()
+    if 'quarter_end' in reset.columns:
+        panel_latest = reset.groupby("ticker")["quarter_end"].max().to_dict()
+    else:
+        # Legacy v3/v4 format: quarter_end is an index level
+        panel_latest = (
+            panel.index.to_frame()
+                 .reset_index(drop=True)
+                 .groupby("ticker")["quarter_end"]
+                 .max()
+                 .to_dict()
+        )
     all_tickers = list(panel_latest.keys())
     if verbose:
         print(f"[staleness] Checking {len(all_tickers)} tickers for new filings …")

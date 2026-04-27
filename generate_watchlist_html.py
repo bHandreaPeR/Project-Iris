@@ -55,63 +55,92 @@ MACRO_QUERY = "India stock market RBI budget FII DII Nifty economy 2025"
 # Signal loader
 # ---------------------------------------------------------------------------
 
-def load_signals(panel: pd.DataFrame, model) -> pd.DataFrame:
+def load_signals(panel: pd.DataFrame, model,
+                 lookback_days: int = 90) -> pd.DataFrame:
+    """
+    Event-driven cross-sectional ranking.
+
+    Uses a rolling 90-day window: for each ticker, take its most recent signal
+    within the last `lookback_days`. Rank pred_3m cross-sectionally within
+    this active set → BUY/SELL/HOLD assignments reflect actual signal freshness.
+
+    Tickers with no signal in the last 90 days are excluded from ranking.
+    """
     feat_cols = model.feat_cols
-    today = pd.Timestamp.now().normalize()
-    latest_per_ticker = (panel
-        .sort_index(level="quarter_end")
-        .groupby(level="ticker").tail(1))
+    today     = pd.Timestamp.now().normalize()
+    cutoff    = today - pd.Timedelta(days=lookback_days)
+
+    # Detect panel format: v5 (signal_date index) or legacy (quarter_end index)
+    idx_names = list(panel.index.names)
+    use_signal_date = 'signal_date' in idx_names
+
+    if use_signal_date:
+        signal_dates = panel.index.get_level_values('signal_date')
+        recent_panel = panel[signal_dates >= cutoff]
+        # Last signal per ticker within the window
+        latest_per_ticker = (recent_panel
+            .sort_index(level='signal_date')
+            .groupby(level='ticker').tail(1))
+    else:
+        # Legacy v3/v4 format: use quarter_end index, clamp future entry_dates
+        latest_per_ticker = (panel
+            .sort_index(level='quarter_end')
+            .groupby(level='ticker').tail(1))
 
     rows = []
-    for tkr, grp in latest_per_ticker.groupby(level="ticker"):
+    for tkr, grp in latest_per_ticker.groupby(level='ticker'):
         try:
             row_data = grp.iloc[-1]
-            feats = row_data[feat_cols]
-            p = model.predict_ticker(feats)
-            entry_date = pd.Timestamp(row_data.get("entry_date", pd.NaT))
-            # If the panel was built before the filing actually occurred, the
-            # entry_date may be future-dated (lag estimate).  If yfinance already
-            # shows the new numbers (i.e. we're reading them right now), treat
-            # the signal as current — clamp future entry_dates to today.
-            if not pd.isnull(entry_date) and entry_date > today:
-                entry_date = today
-            age_days = int((today - entry_date).days) if not pd.isnull(entry_date) else 999
+            feats    = row_data[feat_cols]
+            p        = model.predict_ticker(feats)
+
+            if use_signal_date:
+                sd = grp.index.get_level_values('signal_date')[-1]
+                signal_date = pd.Timestamp(sd)
+            else:
+                # Legacy: read entry_date column, clamp futures to today
+                signal_date = pd.Timestamp(row_data.get('entry_date', pd.NaT))
+                if not pd.isnull(signal_date) and signal_date > today:
+                    signal_date = today
+
+            age_days = int((today - signal_date).days) if not pd.isnull(signal_date) else 999
+
             rows.append({
-                "ticker":     tkr,
-                "pred_3m":   p["fwd_3m"]["point"],
-                "lower_3m":  p["fwd_3m"]["lower"],
-                "upper_3m":  p["fwd_3m"]["upper"],
-                "pred_1m":   p["fwd_1m"]["point"],
-                "pred_12m":  p["fwd_12m"]["point"],
-                "_feats":    feats,
-                "entry_date": entry_date,
-                "age_days":   age_days,
+                'ticker':      tkr,
+                'pred_3m':     p['fwd_3m']['point'],
+                'lower_3m':    p['fwd_3m']['lower'],
+                'upper_3m':    p['fwd_3m']['upper'],
+                'pred_1m':     p['fwd_1m']['point'],
+                'pred_12m':    p['fwd_12m']['point'],
+                '_feats':      feats,
+                'entry_date':  signal_date,
+                'age_days':    age_days,
             })
         except Exception:
             pass
 
     df = (pd.DataFrame(rows)
-          .sort_values("pred_3m", ascending=False)
+          .sort_values('pred_3m', ascending=False)
           .reset_index(drop=True))
     n = len(df)
-    df["pct_rank"]   = ((n - df.index) / n * 100)
-    df["signal"]     = "HOLD"
-    df.loc[df["pct_rank"] >= 90, "signal"] = "BUY"
-    df.loc[df["pct_rank"] <= 10, "signal"] = "SELL"
-    df["confidence"] = "Medium"
-    df.loc[df["pct_rank"] >= 97, "confidence"] = "High"
-    df.loc[df["pct_rank"] <= 3,  "confidence"] = "High"
+    df['pct_rank']   = ((n - df.index) / n * 100)
+    df['signal']     = 'HOLD'
+    df.loc[df['pct_rank'] >= 90, 'signal'] = 'BUY'
+    df.loc[df['pct_rank'] <= 10, 'signal'] = 'SELL'
+    df['confidence'] = 'Medium'
+    df.loc[df['pct_rank'] >= 97, 'confidence'] = 'High'
+    df.loc[df['pct_rank'] <= 3,  'confidence'] = 'High'
 
-    # Sort: freshest first (age_days asc), then by bias strength within same age bucket
-    # BUYs:  highest pred_3m first (strongest bullish bias)
-    # SELLs: lowest pred_3m first  (strongest bearish bias)
-    buys  = df[df["signal"] == "BUY"].sort_values(["age_days", "pred_3m"], ascending=[True, False])
-    sells = df[df["signal"] == "SELL"].sort_values(["age_days", "pred_3m"], ascending=[True, True])
-    holds = df[df["signal"] == "HOLD"]
+    # Sort: freshest first, then by bias strength
+    buys  = df[df['signal'] == 'BUY'].sort_values(['age_days', 'pred_3m'],  ascending=[True, False])
+    sells = df[df['signal'] == 'SELL'].sort_values(['age_days', 'pred_3m'], ascending=[True, True])
+    holds = df[df['signal'] == 'HOLD']
     df = pd.concat([buys, sells, holds]).reset_index(drop=True)
 
-    print(f"Scored {n} tickers | BUYs: {(df['signal']=='BUY').sum()} | SELLs: {(df['signal']=='SELL').sum()}")
-    print(f"Signal ages — <30d: {(df['age_days']<=30).sum()}  <60d: {(df['age_days']<=60).sum()}  <90d: {(df['age_days']<=90).sum()}")
+    print(f"Scored {n} tickers in rolling {lookback_days}d window | "
+          f"BUYs: {(df['signal']=='BUY').sum()} | SELLs: {(df['signal']=='SELL').sum()}")
+    print(f"Signal ages — <30d: {(df['age_days']<=30).sum()}  "
+          f"<60d: {(df['age_days']<=60).sum()}  <90d: {(df['age_days']<=90).sum()}")
     return df
 
 # ---------------------------------------------------------------------------

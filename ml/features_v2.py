@@ -195,11 +195,21 @@ def compute_all_v2(stmts: dict,
                    as_of: pd.Timestamp,
                    shareholding: dict | None = None,
                    insider: dict | None = None,
-                   news: dict | None = None) -> dict:
+                   news: dict | None = None,
+                   corp_actions: dict | None = None,
+                   fno: dict | None = None) -> dict:
     """
     Compute the full feature set for one (ticker, date) snapshot.
-    Optional inputs (shareholding, insider, news) are incorporated when
-    available; their features remain NaN otherwise — never imputed.
+    Optional inputs are incorporated when available; NaN otherwise.
+
+    Args:
+        stmts        : financial statements dict (income, balance, cashflow, etc.)
+        as_of        : signal_date — all price/momentum features clipped to this date
+        shareholding : NSE shareholding pattern features (sh_* keys)
+        insider      : SEC Form 4 insider transaction features
+        news         : GDELT + FinBERT news sentiment features
+        corp_actions : corporate actions features (corp_* keys)
+        fno          : NSE F&O derivatives features (fo_* keys)
 
     Returns a flat dict of float features.
     """
@@ -262,13 +272,60 @@ def compute_all_v2(stmts: dict,
             feats[k] = _nan()
 
     # ── Optional: News sentiment ─────────────────────────────────────────
+    _news_keys = [
+        'news_direct_score', 'news_direct_n',
+        'news_sector_score', 'news_sector_n',
+        'news_macro_score',  'news_macro_n',
+        'news_pulse_7d',     'news_vol_spike',   'news_event_flag',
+    ]
     if news:
         feats.update(news)
+        # Ensure all keys exist
+        for k in _news_keys:
+            feats.setdefault(k, _nan())
     else:
-        for k in ['news_direct_score', 'news_direct_n',
-                  'news_sector_score', 'news_sector_n',
-                  'news_macro_score',  'news_macro_n']:
+        for k in _news_keys:
             feats[k] = _nan()
+
+    # ── Optional: Corporate actions ──────────────────────────────────────
+    _corp_keys = [
+        'corp_div_yield_ttm', 'corp_div_growth_3y', 'corp_div_consistency',
+        'corp_buyback_flag',  'corp_rights_flag',   'corp_bonus_flag',
+        'corp_promoter_buy_flag',
+    ]
+    if corp_actions:
+        feats.update(corp_actions)
+        for k in _corp_keys:
+            feats.setdefault(k, _nan())
+    else:
+        for k in _corp_keys:
+            feats[k] = _nan()
+
+    # ── Optional: F&O derivatives ────────────────────────────────────────
+    _fno_keys = [
+        'fo_pcr', 'fo_pcr_trend', 'fo_iv_atm', 'fo_iv_pct_52w',
+        'fo_oi_change_5d_pct', 'fo_long_buildup', 'fo_short_buildup',
+        'fo_max_pain',
+    ]
+    if fno:
+        feats.update(fno)
+        for k in _fno_keys:
+            feats.setdefault(k, _nan())
+    else:
+        for k in _fno_keys:
+            feats[k] = _nan()
+
+    # ── Market cap bucket (size proxy) ───────────────────────────────────
+    mkt_cap = float(info.get('marketCap') or 0)
+    # SEBI definitions (INR): large >₹20k Cr = 2e11, mid ₹5–20k Cr, small <₹5k Cr
+    if mkt_cap >= 2e11:
+        feats['market_cap_bucket'] = 2.0
+    elif mkt_cap >= 5e10:
+        feats['market_cap_bucket'] = 1.0
+    elif mkt_cap > 0:
+        feats['market_cap_bucket'] = 0.0
+    else:
+        feats['market_cap_bucket'] = _nan()
 
     return feats
 

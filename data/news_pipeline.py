@@ -235,3 +235,93 @@ def fetch_news_sentiment(ticker: str,
         'news_macro_score':   _weighted_avg(macro_scores),
         'news_macro_n':       float(len(macro_scores)),
     }
+
+
+# Event keywords that suggest high-impact corporate news
+_EVENT_KEYWORDS = [
+    'buyback', 'acquisition', 'merger', 'takeover', 'rights issue',
+    'fraud', 'scam', 'sebi', 'cbi', 'ed raid', 'default', 'npa',
+    'delisting', 'bonus', 'dividend', 'split', 'demerger', 'ipo',
+    'qip', 'fpo', 'management change', 'md resigned', 'ceo change',
+]
+
+
+def _scan_event_keywords(articles: list[dict]) -> float:
+    """Return 1.0 if any article title contains a high-impact keyword, else 0.0."""
+    for a in articles:
+        title = (a.get('title') or '').lower()
+        if any(kw in title for kw in _EVENT_KEYWORDS):
+            return 1.0
+    return 0.0
+
+
+def score_yfinance_news(news_items: list[dict]) -> float:
+    """
+    Score yfinance t.news items using the existing FinBERT/VADER pipeline.
+
+    Args:
+        news_items : list of yfinance news dicts (have 'content' with 'title')
+
+    Returns float in [-1, +1], or NaN if no scoreable items.
+    """
+    texts = []
+    for item in (news_items or []):
+        # yfinance news structure: item['content']['title']
+        content = item.get('content') or {}
+        title   = content.get('title') or item.get('title') or ''
+        if title:
+            texts.append(title)
+    if not texts:
+        return float('nan')
+    scores = _score_texts(texts)
+    return _weighted_avg(scores)
+
+
+def fetch_news_sentiment_windowed(ticker: str,
+                                  company_name: str = "",
+                                  sector: str = "",
+                                  live_only: bool = False) -> dict:
+    """
+    Multi-window news sentiment: fetches 7d, 30d, and 90d GDELT windows
+    in one call (all three hit the 6h cache so repeated calls are fast).
+
+    New keys vs fetch_news_sentiment():
+      news_pulse_7d       : direct sentiment over last 7 days
+      news_vol_spike      : 7d article count / (90d count / 13) — >2 = unusual
+      news_event_flag     : 1.0 if high-impact keyword found in last 7d articles
+
+    live_only: if False, pulse/vol/event features are set to NaN
+      (used for historical panel rows where real-time news is not meaningful).
+
+    Returns all keys from fetch_news_sentiment() (30d base) plus the 3 new keys.
+    """
+    # Base: 30d sentiment (standard features)
+    base = fetch_news_sentiment(ticker, company_name, sector, timespan='30d')
+
+    if not live_only:
+        base['news_pulse_7d']    = float('nan')
+        base['news_vol_spike']   = float('nan')
+        base['news_event_flag']  = float('nan')
+        return base
+
+    # Live-only pulse features
+    base_ticker = ticker.replace('.NS', '').replace('.BO', '')
+    direct_query = f'"{base_ticker}"'
+    if company_name:
+        short_name = company_name.split()[0] if company_name else ''
+        direct_query = f'"{base_ticker}" OR "{short_name}"' if short_name else direct_query
+
+    articles_7d  = _gdelt_fetch(direct_query, '7d',  max_records=25)
+    articles_90d = _gdelt_fetch(direct_query, '90d', max_records=50)
+
+    texts_7d    = [a.get('title', '') for a in articles_7d if a.get('title')]
+    scores_7d   = _score_texts(texts_7d)
+
+    n7  = float(len(scores_7d))
+    n90 = float(len([a for a in articles_90d if a.get('title')]))
+
+    base['news_pulse_7d']   = _weighted_avg(scores_7d)
+    base['news_vol_spike']  = n7 / max(n90 / 13, 0.1)
+    base['news_event_flag'] = _scan_event_keywords(articles_7d)
+
+    return base
