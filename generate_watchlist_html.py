@@ -69,6 +69,12 @@ def load_signals(panel: pd.DataFrame, model) -> pd.DataFrame:
             feats = row_data[feat_cols]
             p = model.predict_ticker(feats)
             entry_date = pd.Timestamp(row_data.get("entry_date", pd.NaT))
+            # If the panel was built before the filing actually occurred, the
+            # entry_date may be future-dated (lag estimate).  If yfinance already
+            # shows the new numbers (i.e. we're reading them right now), treat
+            # the signal as current — clamp future entry_dates to today.
+            if not pd.isnull(entry_date) and entry_date > today:
+                entry_date = today
             age_days = int((today - entry_date).days) if not pd.isnull(entry_date) else 999
             rows.append({
                 "ticker":     tkr,

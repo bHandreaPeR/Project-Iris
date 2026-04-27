@@ -118,8 +118,19 @@ def build_ticker_panel(ticker: str,
     rows = []
     quarter_end_set: set[pd.Timestamp] = set()
 
-    def _build_row(qe: pd.Timestamp) -> dict | None:
-        entry_date = qe + pd.DateOffset(days=lag)
+    def _build_row(qe: pd.Timestamp, is_latest: bool = False) -> dict | None:
+        lag_date = qe + pd.DateOffset(days=lag)
+        # For the most-recent quarter: if the lag-based estimate is still in
+        # the future (filing not yet due) but we're running the collector now
+        # and yfinance already shows the numbers, use today as entry_date so
+        # the signal is treated as current rather than future-dated.
+        # For historical rows we always use the lag-based date (needed for
+        # accurate forward-return computation during training).
+        today = pd.Timestamp.now().normalize()
+        if is_latest and lag_date > today:
+            entry_date = today
+        else:
+            entry_date = lag_date
         snap = _clip_stmts(stmts, qe)
 
         news_data = None
@@ -153,8 +164,9 @@ def build_ticker_panel(ticker: str,
         return row
 
     # Quarterly rows (from income stmt — typically 13 quarters from screener.in)
+    latest_qe = quarter_ends[-1] if quarter_ends else None
     for qe in quarter_ends:
-        r = _build_row(qe)
+        r = _build_row(qe, is_latest=(qe == latest_qe))
         if r is not None:
             rows.append(r)
             quarter_end_set.add(qe)
@@ -163,10 +175,11 @@ def build_ticker_panel(ticker: str,
     ann_inc = stmts.get('annual_income', pd.DataFrame())
     if not ann_inc.empty:
         ann_dates = sorted([pd.Timestamp(c) for c in ann_inc.columns])
+        latest_ann = ann_dates[-1] if ann_dates else None
         for ann_qe in ann_dates:
             if ann_qe in quarter_end_set:
                 continue  # already have a quarterly row for this period
-            r = _build_row(ann_qe)
+            r = _build_row(ann_qe, is_latest=(ann_qe == latest_ann))
             if r is not None:
                 rows.append(r)
 

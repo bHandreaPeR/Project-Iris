@@ -1,133 +1,219 @@
 """
-Incremental India panel builder.
-Collects only tickers not already in v2_panel_india.parquet,
-then merges and saves v2_panel_india_full.parquet.
+Incremental India panel updater.
+
+Two modes:
+  python collect_india_incremental.py           → refresh stale tickers + add new ones
+  python collect_india_incremental.py --new-only → only collect tickers missing from panel
+
+Refresh logic:
+  For every ticker already in the panel, fetch its latest income statement
+  (via yfinance).  If yfinance now reports a newer quarter_end than the one
+  stored in the panel, the ticker is marked "stale" and re-collected.
+  This means: when Bandhan files today, tomorrow's run detects the new quarter
+  and produces a fresh signal with entry_date = today (age = 0 days).
 """
 import sys
+import argparse
 import pickle
+import warnings
 import pandas as pd
+import yfinance as yf
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from data.universe import fetch_nifty_india
-from ml.collector_v2 import build_panel, panel_summary
-from ml.multi_horizon import MultiHorizonModel, TARGET_COLS
-from ml.predict_report import ranked_watchlist
+from ml.collector_v2 import build_panel, build_ticker_panel, panel_summary
+from ml.multi_horizon import MultiHorizonModel
 
-_OUT = Path("ml_output")
-EXISTING_PANEL = _OUT / "v2_panel_india.parquet"
-NEW_PANEL      = _OUT / "v2_panel_india_new.parquet"
-FULL_PANEL     = _OUT / "v2_panel_india_full.parquet"
-MODEL_PATH     = _OUT / "v2_model_india_full.pkl"
+_OUT         = Path("ml_output")
+PANEL_V3     = _OUT / "v2_panel_india_v3.parquet"   # canonical panel
+MODEL_V3     = _OUT / "v2_model_india_v3.pkl"
+STALE_CACHE  = _OUT / "stale_tickers_last_run.csv"
 
+REFRESH_CHECK_WORKERS = 20   # parallel yfinance calls for staleness check
+COLLECT_WORKERS       = 1    # sequential for main collect (rate-limit safe)
+
+
+# ---------------------------------------------------------------------------
+# Staleness detection
+# ---------------------------------------------------------------------------
+
+def _latest_yf_quarter(ticker: str) -> pd.Timestamp | None:
+    """Return the latest quarter_end yfinance currently has for this ticker."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            t   = yf.Ticker(ticker)
+            inc = t.quarterly_income_stmt
+            if inc is None or inc.empty:
+                return None
+            cols = [pd.Timestamp(c) for c in inc.columns]
+            return max(cols)
+    except Exception:
+        return None
+
+
+def find_stale_tickers(panel: pd.DataFrame, max_workers: int = REFRESH_CHECK_WORKERS,
+                       verbose: bool = True) -> list[str]:
+    """
+    Return tickers whose latest panel quarter_end is older than what yfinance
+    currently reports — i.e. the company has filed new results since last run.
+    """
+    # Latest quarter per ticker in the panel
+    panel_latest: dict[str, pd.Timestamp] = (
+        panel.reset_index()
+             .groupby("ticker")["quarter_end"]
+             .max()
+             .to_dict()
+    )
+    all_tickers = list(panel_latest.keys())
+    if verbose:
+        print(f"[staleness] Checking {len(all_tickers)} tickers for new filings …")
+
+    stale: list[str] = []
+    checked = 0
+
+    def _check(tkr: str) -> tuple[str, bool]:
+        yf_latest = _latest_yf_quarter(tkr)
+        if yf_latest is None:
+            return tkr, False
+        return tkr, yf_latest > panel_latest[tkr]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_check, t): t for t in all_tickers}
+        for fut in as_completed(futures):
+            tkr, is_stale = fut.result()
+            checked += 1
+            if is_stale:
+                stale.append(tkr)
+            if verbose and checked % 200 == 0:
+                print(f"  checked {checked}/{len(all_tickers)} … {len(stale)} stale so far")
+
+    if verbose:
+        print(f"[staleness] Done. {len(stale)} stale tickers found.")
+    return stale
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    # 1. Load full universe
-    print("[incremental] Resolving India universe …")
-    all_tickers = fetch_nifty_india()
-    ns = [t for t in all_tickers if t.endswith('.NS')]
-    bo = [t for t in all_tickers if t.endswith('.BO')]
-    print(f"[incremental] Universe: {len(all_tickers)} ({len(ns)} NSE + {len(bo)} BSE-only)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--new-only",   action="store_true",
+                        help="Only collect tickers missing from panel; skip refresh check")
+    parser.add_argument("--panel",      default=str(PANEL_V3),
+                        help="Path to existing panel parquet")
+    parser.add_argument("--model",      default=str(MODEL_V3),
+                        help="Path to existing model pkl")
+    parser.add_argument("--no-retrain", action="store_true",
+                        help="Update panel but skip model re-train (fast, for watchlist refresh)")
+    args = parser.parse_args()
 
-    # 2. Find which tickers still need collection
-    existing_tickers: set[str] = set()
-    if EXISTING_PANEL.exists():
-        ex = pd.read_parquet(EXISTING_PANEL)
-        existing_tickers = set(ex.index.get_level_values('ticker').unique())
-        print(f"[incremental] Existing panel: {len(existing_tickers)} tickers, {len(ex)} rows")
+    panel_path = Path(args.panel)
+    model_path = Path(args.model)
 
-    new_tickers = [t for t in all_tickers if t not in existing_tickers]
-    print(f"[incremental] New tickers to collect: {len(new_tickers)}")
-
-    # 3. Collect new tickers
-    if new_tickers:
-        if NEW_PANEL.exists():
-            NEW_PANEL.unlink()  # force fresh collect of new tickers
-        new_panel = build_panel(
-            new_tickers,
-            cache_path=str(NEW_PANEL),
-            use_shareholding=True,
-            use_insiders=False,
-            use_news=False,
-            verbose=True,
-        )
-        print(f"[incremental] New panel: {len(new_panel)} rows")
-    else:
-        new_panel = pd.DataFrame()
-        print("[incremental] No new tickers to collect.")
-
-    # 4. Merge
-    parts = []
-    if EXISTING_PANEL.exists():
-        parts.append(pd.read_parquet(EXISTING_PANEL))
-    if not new_panel.empty:
-        parts.append(new_panel)
-
-    if not parts:
-        print("[incremental] ERROR: no data at all.")
+    # ------------------------------------------------------------------
+    # 1. Load existing panel
+    # ------------------------------------------------------------------
+    if not panel_path.exists():
+        print(f"[incremental] Panel not found at {panel_path}. Run run_full_india_v3.py first.")
         sys.exit(1)
 
-    full_panel = pd.concat(parts).sort_index()
-    # Drop duplicate (ticker, quarter_end) keeping last
-    full_panel = full_panel[~full_panel.index.duplicated(keep='last')]
-    full_panel.to_parquet(FULL_PANEL)
-    tickers_in = full_panel.index.get_level_values('ticker').nunique()
-    ns_in = sum(1 for t in full_panel.index.get_level_values('ticker').unique() if t.endswith('.NS'))
-    bo_in = sum(1 for t in full_panel.index.get_level_values('ticker').unique() if t.endswith('.BO'))
-    print(f"\n[incremental] Full panel: {len(full_panel)} rows, {tickers_in} tickers ({ns_in} NSE, {bo_in} BSE)")
-    print(f"[incremental] Saved → {FULL_PANEL}")
+    panel = pd.read_parquet(panel_path)
+    existing_tickers: set[str] = set(panel.index.get_level_values("ticker").unique())
+    print(f"[incremental] Loaded panel: {len(panel)} rows, {len(existing_tickers)} tickers")
 
-    # 5. Train
-    print("\n[incremental] Training multi-horizon model on full India panel …")
-    panel_summary(full_panel)
-    model = MultiHorizonModel()
-    metrics = model.train(full_panel)
-    print(model.walk_forward_summary(metrics))
+    # ------------------------------------------------------------------
+    # 2. Load universe (from panel itself — no extra fetch needed)
+    # ------------------------------------------------------------------
+    all_tickers = sorted(existing_tickers)
 
-    with open(MODEL_PATH, 'wb') as f:
-        pickle.dump(model, f)
-    print(f"[incremental] Model saved → {MODEL_PATH}")
+    # ------------------------------------------------------------------
+    # 3. Find tickers to refresh (stale) and tickers to add (new)
+    # ------------------------------------------------------------------
+    tickers_to_recollect: list[str] = []
 
-    # 6. Top picks
-    feat_cols = model.feat_cols
-    latest_q = full_panel.index.get_level_values('quarter_end').max()
-    current  = full_panel.loc[full_panel.index.get_level_values('quarter_end') == latest_q]
-    print(f"\n[incremental] Generating predictions for {len(current)} tickers in Q {latest_q.date()} …")
+    if not args.new_only:
+        stale = find_stale_tickers(panel, verbose=True)
+        tickers_to_recollect.extend(stale)
+        # Cache stale list for debugging
+        pd.DataFrame({"ticker": stale}).to_csv(STALE_CACHE, index=False)
+        print(f"[incremental] {len(stale)} tickers to refresh: {stale[:10]}{'…' if len(stale)>10 else ''}")
+    else:
+        print("[incremental] --new-only: skipping staleness check")
 
-    import yfinance as yf
-    all_tkrs = current.index.get_level_values('ticker').tolist()
-    price_map: dict[str, float] = {}
-    for chunk in [all_tkrs[i:i+200] for i in range(0, len(all_tkrs), 200)]:
-        try:
-            pdata = yf.download(chunk, period='2d', interval='1d',
-                                auto_adjust=True, progress=False)['Close']
-            if hasattr(pdata, 'iloc'):
-                last = pdata.iloc[-1] if len(pdata) > 0 else pdata
-                for tkr in chunk:
-                    try:
-                        v = float(last[tkr]) if tkr in last.index else float('nan')
-                        if v > 0:
-                            price_map[tkr] = v
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+    if not tickers_to_recollect:
+        print("[incremental] Nothing to update. Panel is current.")
+        # Still regenerate watchlist HTML from existing model
+        _regenerate_html(panel, model_path)
+        return
 
-    ticker_preds: dict[str, dict] = {}
-    for tkr, grp in current.groupby(level='ticker'):
-        try:
-            feats = grp.iloc[-1][feat_cols]
-            ticker_preds[tkr] = model.predict_ticker(feats)
-        except Exception:
-            pass
+    # ------------------------------------------------------------------
+    # 4. Re-collect stale tickers
+    # ------------------------------------------------------------------
+    print(f"\n[incremental] Re-collecting {len(tickers_to_recollect)} tickers …")
 
-    watchlist = ranked_watchlist(ticker_preds, price_map, horizon='fwd_3m')
-    wl_path = _OUT / "watchlist_india_full.csv"
-    watchlist.to_csv(wl_path)
-    print(f"\n[incremental] Watchlist saved → {wl_path}")
-    print("\nTop 30 India picks (3-month horizon):")
-    print(watchlist.head(30).to_string())
+    # Build fresh rows for stale tickers
+    fresh_panel = build_panel(
+        tickers_to_recollect,
+        cache_path=None,          # no intermediate cache — small batch
+        use_shareholding=True,
+        use_insiders=False,
+        use_news=False,
+        verbose=True,
+    )
+    print(f"[incremental] Fresh rows collected: {len(fresh_panel)}")
+
+    # ------------------------------------------------------------------
+    # 5. Merge: drop stale rows, append fresh rows
+    # ------------------------------------------------------------------
+    stale_set = set(tickers_to_recollect)
+    panel_kept = panel[~panel.index.get_level_values("ticker").isin(stale_set)]
+    updated_panel = pd.concat([panel_kept, fresh_panel]).sort_index()
+    updated_panel = updated_panel[~updated_panel.index.duplicated(keep="last")]
+
+    updated_panel.to_parquet(panel_path)
+    n_tickers = updated_panel.index.get_level_values("ticker").nunique()
+    print(f"\n[incremental] Updated panel: {len(updated_panel)} rows, {n_tickers} tickers")
+    print(f"[incremental] Saved → {panel_path}")
+
+    # ------------------------------------------------------------------
+    # 6. Re-train model (unless --no-retrain)
+    # ------------------------------------------------------------------
+    if not args.no_retrain:
+        print("\n[incremental] Re-training model …")
+        panel_summary(updated_panel)
+        model = MultiHorizonModel()
+        metrics = model.train(updated_panel)
+        print(model.walk_forward_summary(metrics))
+        with open(model_path, "wb") as f:
+            pickle.dump(model, f)
+        print(f"[incremental] Model saved → {model_path}")
+    else:
+        print("[incremental] --no-retrain: loading existing model")
+        with open(model_path, "rb") as f:
+            model = pickle.load(f)
+
+    # ------------------------------------------------------------------
+    # 7. Regenerate watchlist HTML
+    # ------------------------------------------------------------------
+    _regenerate_html(updated_panel, model_path)
+
+
+def _regenerate_html(panel: pd.DataFrame, model_path: Path):
+    """Call the watchlist generator as a subprocess so it picks up the updated panel/model."""
+    import subprocess
+    print("\n[incremental] Regenerating watchlist HTML …")
+    result = subprocess.run(
+        [sys.executable, "generate_watchlist_html.py"],
+        capture_output=False
+    )
+    if result.returncode != 0:
+        print("[incremental] Warning: watchlist generation failed")
+    else:
+        print("[incremental] Watchlist regenerated → ml_output/watchlist_live.html")
 
 
 if __name__ == "__main__":
